@@ -80,13 +80,13 @@ class SECExtractionTests(unittest.TestCase):
         archive = b"<DOCUMENT><TYPE>EX-99\n<FILENAME>other.htm\n<TEXT>Wrong</TEXT></DOCUMENT><DOCUMENT><TYPE>10-Q\n<FILENAME>quarter.htm\n<TEXT><p>Quarterly disclosure</p></TEXT></DOCUMENT>"
         fake = FakeSEC({base + "000001234500000001/quarter.htm": missing,
                         base + "0000012345-00-000001.txt": archive})
-        from src.sec import _filing
+        from src.sec.discovery import _filing
         filing = _filing("KO", 12345, row)
         assert filing is not None
         self.assertEqual(extract_filing(SECClient("Research contact@example.com", opener=fake), filing), "Quarterly disclosure")
 
     def test_blank_primary_uses_archive_document(self):
-        from src.sec import _filing
+        from src.sec.discovery import _filing
         row = dict(accessionNumber="0000012345-00-000001", form="10-Q", filingDate="2000-04-01", reportDate="", primaryDocument="")
         archive_url = "https://www.sec.gov/Archives/edgar/data/12345/0000012345-00-000001.txt"
         archive = b"<DOCUMENT><TYPE>10-Q\n<TEXT><p>Old quarterly disclosure</p></TEXT></DOCUMENT>"
