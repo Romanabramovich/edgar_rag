@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 import json
 import os
@@ -17,6 +17,10 @@ from .storage import (
     load_catalog, open_database, record_error, require_space, save_catalog,
     save_facts, save_filing,
 )
+from .search.config import SearchConfig
+from .search.embeddings import EmbeddingError, OllamaEmbedder
+from .search.indexer import VectorSearchError, index_pending
+from .search.retrieval import search_coverage
 
 
 ORDER = ("KO", "AAPL", "NVDA", "GOOG")
@@ -28,6 +32,7 @@ class ImportReport:
     skipped: int = 0
     errors: int = 0
     stopped_for_space: bool = False
+    imported_accessions: list[str] = field(default_factory=list)
 
 
 def _years_ago(today: date, years: int) -> date:
@@ -95,11 +100,15 @@ def planned_filings(catalogs: dict[str, list], *, today: date) -> list:
 def import_filings(connection: sqlite3.Connection, client: SECClient,
                    *, db_path: Path, reserve_bytes: int = DEFAULT_RESERVE_BYTES,
                    refresh_hours: int = 24, max_filings: int | None = None,
-                   now: datetime | None = None, log=print) -> ImportReport:
+                   now: datetime | None = None, log=print,
+                   embedder: OllamaEmbedder | None = None,
+                   search_config: SearchConfig = SearchConfig(),
+                   embedding_batch_size: int = 16) -> ImportReport:
     if max_filings is not None and max_filings < 1:
         raise ValueError("max_filings must be positive")
     now = now or datetime.now(timezone.utc)
     report = ImportReport()
+    embedding_enabled = embedder is not None
     catalogs = {}
     for ticker in ORDER:
         try:
@@ -129,7 +138,19 @@ def import_filings(connection: sqlite3.Connection, client: SECClient,
             if save_filing(connection, filing, text, reserve_bytes=reserve_bytes,
                            disk_path=db_path.parent):
                 report.imported += 1
+                report.imported_accessions.append(filing.accession)
                 log(f"Imported {filing.ticker} {filing.form} {filing.filed} {filing.accession}")
+                if embedding_enabled and embedder:
+                    try:
+                        count = index_pending(
+                            connection, embedder, config=search_config,
+                            batch_size=embedding_batch_size,
+                            accessions=[filing.accession],
+                        )
+                        log(f"Indexed {count} passage(s) for {filing.accession}")
+                    except (EmbeddingError, VectorSearchError, sqlite3.Error) as exc:
+                        log(f"Search indexing deferred for {filing.accession}: {exc}")
+                        embedding_enabled = False
         except DiskReserveError as exc:
             report.stopped_for_space = True
             log(str(exc))
@@ -142,13 +163,17 @@ def import_filings(connection: sqlite3.Connection, client: SECClient,
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Import SEC filings into local SQLite")
-    parser.add_argument("command", choices=("import", "coverage"))
+    parser = argparse.ArgumentParser(description="Import and index SEC filings in local SQLite")
+    parser.add_argument("command", choices=("import", "coverage", "index"))
     parser.add_argument("--db", type=Path, default=Path("data/edgar.sqlite"))
     parser.add_argument("--user-agent", default=os.environ.get("SEC_USER_AGENT"))
     parser.add_argument("--reserve-gib", type=float, default=6.0)
     parser.add_argument("--max-filings", type=int)
     parser.add_argument("--refresh-hours", type=int, default=24)
+    parser.add_argument("--embedding-model", default="nomic-embed-text")
+    parser.add_argument("--ollama-url", default="http://127.0.0.1:11434")
+    parser.add_argument("--embedding-batch-size", type=int, default=16)
+    parser.add_argument("--embedding-limit", type=int)
     args = parser.parse_args(argv)
     if args.reserve_gib < 6:
         parser.error("reserve must be at least 6 GiB")
@@ -156,18 +181,45 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("refresh-hours must be positive")
     if args.command == "import" and not args.user_agent:
         parser.error("Set --user-agent or SEC_USER_AGENT with a contact email")
+    if args.embedding_batch_size < 1 or (args.embedding_limit is not None and args.embedding_limit < 1):
+        parser.error("embedding batch size and limit must be positive")
     reserve = int(args.reserve_gib * GIB)
     try:
         connection = open_database(args.db, reserve_bytes=reserve)
         try:
             if args.command == "coverage":
-                print(json.dumps(coverage(connection), indent=2))
+                print(json.dumps({"filings": coverage(connection),
+                                  "search": search_coverage(connection)}, indent=2))
                 return 0
+            if args.command == "index":
+                config = SearchConfig(embedding_model=args.embedding_model)
+                try:
+                    indexed = index_pending(
+                        connection, OllamaEmbedder(args.embedding_model, base_url=args.ollama_url),
+                        config=config, batch_size=args.embedding_batch_size,
+                        limit=args.embedding_limit,
+                    )
+                except (EmbeddingError, VectorSearchError, sqlite3.Error) as exc:
+                    print(f"Semantic indexing failed: {exc}", file=sys.stderr)
+                    return 2
+                print(json.dumps({"indexed": indexed, "search": search_coverage(
+                    connection, config=config)}, indent=2))
+                return 0
+            config = SearchConfig(embedding_model=args.embedding_model)
             report = import_filings(connection, SECClient(args.user_agent),
                                     db_path=args.db, reserve_bytes=reserve,
                                     refresh_hours=args.refresh_hours,
-                                    max_filings=args.max_filings)
-            print(json.dumps({"report": vars(report), "coverage": coverage(connection)}, indent=2))
+                                    max_filings=args.max_filings,
+                                    embedder=OllamaEmbedder(args.embedding_model,
+                                                           base_url=args.ollama_url),
+                                    search_config=config,
+                                    embedding_batch_size=args.embedding_batch_size)
+            report_json = {key: value for key, value in vars(report).items()
+                           if key != "imported_accessions"}
+            print(json.dumps({"report": report_json,
+                              "coverage": coverage(connection),
+                              "search": search_coverage(connection,
+                                  config=config)}, indent=2))
             return 1 if report.errors else 0
         finally:
             connection.close()
