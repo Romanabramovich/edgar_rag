@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
@@ -67,6 +68,8 @@ class StorageTests(unittest.TestCase):
         save_catalog(self.db, "KO", 12345, [replacement])
         self.assertEqual(self.db.execute("SELECT COUNT(*) FROM filings").fetchone()[0], 1)
         self.assertEqual(self.db.execute("SELECT COUNT(*) FROM filing_text").fetchone()[0], 0)
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM passage_index").fetchone()[0], 0)
+        self.assertEqual(self.db.execute("SELECT COUNT(*) FROM passage_fts").fetchone()[0], 0)
 
     def test_passages_cover_exact_source_text(self):
         body = "First paragraph\n" + "x" * 300 + "\nLast paragraph"
@@ -75,6 +78,59 @@ class StorageTests(unittest.TestCase):
         self.assertTrue(all(chunk in body for chunk in chunks))
         self.assertEqual(chunks[0][0], body[0])
         self.assertEqual(chunks[-1][-1], body[-1])
+
+    def test_search_schema_indexes_passages_and_survives_reopen(self):
+        item = filing("KO", "0000012345-25-000010", "2025-02-10")
+        save_catalog(self.db, "KO", 12345, [item])
+        save_filing(self.db, item, "Revenue improved meaningfully during the year.",
+                    reserve_bytes=0, disk_path=self.db_path.parent)
+        match = self.db.execute(
+            "SELECT i.passage_id,i.accession,i.ordinal,p.body "
+            "FROM passage_fts AS f JOIN passage_index AS i ON i.passage_id=f.rowid "
+            "JOIN passages AS p ON p.accession=i.accession AND p.ordinal=i.ordinal "
+            "WHERE passage_fts MATCH ?", ("meaningfully",),
+        ).fetchone()
+        self.assertIsNotNone(match)
+        self.assertEqual((match["accession"], match["ordinal"]), (item.accession, 0))
+        self.assertEqual(match["body"], "Revenue improved meaningfully during the year.")
+
+        reopened = open_database(self.db_path, reserve_bytes=0)
+        try:
+            self.assertEqual(reopened.execute("SELECT COUNT(*) FROM filing_text").fetchone()[0], 1)
+            self.assertEqual(reopened.execute("SELECT COUNT(*) FROM passage_index").fetchone()[0], 1)
+            self.assertEqual(reopened.execute(
+                "SELECT COUNT(*) FROM passage_fts WHERE passage_fts MATCH ?", ("meaningfully",)
+            ).fetchone()[0], 1)
+        finally:
+            reopened.close()
+
+    def test_open_database_migrates_legacy_passages_without_data_loss(self):
+        legacy_path = Path(self.temp.name) / "legacy.sqlite"
+        legacy = sqlite3.connect(legacy_path)
+        legacy.executescript("""
+            CREATE TABLE companies(ticker TEXT PRIMARY KEY,cik INTEGER NOT NULL,
+                discovered_at TEXT,facts_refreshed_at TEXT);
+            CREATE TABLE filings(accession TEXT PRIMARY KEY,ticker TEXT NOT NULL,cik INTEGER NOT NULL,
+                form TEXT NOT NULL,filed TEXT NOT NULL,report_date TEXT,primary_document TEXT NOT NULL,
+                filing_url TEXT NOT NULL,source_url TEXT NOT NULL,stored_at TEXT);
+            CREATE TABLE passages(accession TEXT NOT NULL,ordinal INTEGER NOT NULL,body TEXT NOT NULL,
+                PRIMARY KEY(accession,ordinal));
+            INSERT INTO companies VALUES('KO',12345,NULL,NULL);
+            INSERT INTO filings VALUES('0000012345-25-000020','KO',12345,'10-K','2025-02-20',
+                '2024-12-31','annual.htm','https://sec.gov/filing','https://sec.gov/doc','2025-02-20');
+            INSERT INTO passages VALUES('0000012345-25-000020',0,'Legacy passage about revenue growth');
+        """)
+        legacy.close()
+
+        migrated = open_database(legacy_path, reserve_bytes=0)
+        try:
+            self.assertEqual(migrated.execute("SELECT COUNT(*) FROM filings").fetchone()[0], 1)
+            self.assertEqual(migrated.execute("SELECT COUNT(*) FROM passages").fetchone()[0], 1)
+            self.assertEqual(migrated.execute(
+                "SELECT COUNT(*) FROM passage_fts WHERE passage_fts MATCH ?", ("revenue",)
+            ).fetchone()[0], 1)
+        finally:
+            migrated.close()
 
     def test_disk_reserve_blocks_write_before_transaction(self):
         fake_usage = lambda path: SimpleNamespace(free=6 * GIB + 10)
